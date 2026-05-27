@@ -1,0 +1,622 @@
+---
+title: "Virginia Invasive Plant Species Analysis"
+author: "Ray Santiago and Seun Oladipo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cosmo
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    toc_depth: 3
+    df_print: paged
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache   = TRUE        # cache heavy chunks so re-knitting is fast
+)
+```
+
+# 1. Libraries
+
+```{r libraries}
+library(tidyverse)
+library(readxl)
+library(scales)
+library(patchwork)
+
+# Spatial
+library(sf)
+library(terra)
+library(tmap)
+
+# Climate
+library(geodata)
+
+# SDM
+library(dismo)        # Bioclim + background sampling
+library(randomForest) # RF classifier for SDM
+```
+
+---
+
+# 2. Data Loading & Cleaning
+
+## 2a. VIPS spreadsheet
+
+```{r vips}
+vips_raw <- read_excel("vips-list-oct2024.xlsx", skip = 1)
+
+vips_clean <- vips_raw |>
+  mutate(
+    # Presence flags: any non-NA = 1, NA = 0
+    across(
+      c(Mountain, Piedmont, Coastal, Full, Partial,
+        Shade, Hydric, Mesic, Xeric),
+      ~ as.integer(!is.na(.))
+    ),
+    # Strip trailing whitespace from rank (causes silent grouping errors)
+    `VA Invasiveness Rank` = str_trim(`VA Invasiveness Rank`)
+  ) |>
+  drop_na(`Common Name`, `Scientific Name`)
+
+glimpse(vips_clean)
+```
+
+## 2b. Invasive plant geodatabase
+
+```{r invasive-load}
+# Bounding box clipped to Virginia
+va_bbox <- st_bbox(
+  c(xmin = -83.7, ymin = 36.5, xmax = -75.2, ymax = 39.5),
+  crs = st_crs(4326)
+)
+
+invasive_sf <- st_read(
+  "Bio_InvasivePlantCurrent.gdb/",
+  wkt_filter = st_as_text(st_as_sfc(va_bbox)),
+  quiet = TRUE
+)
+
+cat("Raw records loaded:", nrow(invasive_sf), "\n")
+```
+
+```{r invasive-clean}
+# Lookup table: fill missing lifeform from known species biology
+lifeform_lookup <- c(
+  "Ailanthus altissima"       = "Tree",
+  "Microstegium vimineum"     = "Graminoid",
+  "Rosa multiflora"           = "Shrub",
+  "Elaeagnus umbellata"       = "Shrub",
+  "Berberis thunbergii"       = "Shrub",
+  "Alliaria petiolata"        = "Forb/Herb",
+  "Lonicera japonica"         = "Vine",
+  "Lonicera maackii"          = "Shrub",
+  "Lonicera morrowii"         = "Shrub",
+  "Paulownia tomentosa"       = "Tree",
+  "Celastrus orbiculatus"     = "Vine",
+  "Ligustrum vulgare"         = "Shrub",
+  "Lespedeza cuneata"         = "Forb/Herb",
+  "Phalaris arundinacea"      = "Graminoid",
+  "Tussilago farfara"         = "Forb/Herb",
+  "Leucanthemum vulgare"      = "Forb/Herb",
+  "Securigera varia"          = "Forb/Herb",
+  "Polygonum cespitosum"      = "Forb/Herb"
+)
+
+invasive_va <- invasive_sf |>
+  # Step 1: Geometry validation
+  filter(st_is_valid(SHAPE)) |>
+  st_make_valid() |>
+
+  # Step 2: Keep only needed columns
+  select(
+    ACCEPTED_SCIENTIFIC_NAME,
+    ACCEPTED_COMMON_NAME,
+    LIFEFORM_DOMINANT,
+    INFESTED_AREA,
+    GIS_ACRES,
+    DATE_COLLECTED,
+    OWNER_NAME,
+    FS_UNIT_NAME,
+    DISTANCE_TO_WATER_HORIZONTAL,
+    SHAPE
+  ) |>
+
+  # Step 3: Collapse subspecies to species level
+  mutate(
+    ACCEPTED_SCIENTIFIC_NAME = case_when(
+      str_detect(ACCEPTED_SCIENTIFIC_NAME, "Elaeagnus umbellata")  ~ "Elaeagnus umbellata",
+      str_detect(ACCEPTED_SCIENTIFIC_NAME, "Polygonum cespitosum") ~ "Polygonum cespitosum",
+      TRUE ~ ACCEPTED_SCIENTIFIC_NAME
+    )
+  ) |>
+
+  # Step 4: Remove duplicates (same species x geometry = repeated survey)
+  distinct(ACCEPTED_SCIENTIFIC_NAME, SHAPE, .keep_all = TRUE) |>
+
+  # Step 5: Backfill lifeform and impute numeric NAs
+  mutate(
+    LIFEFORM_DOMINANT = case_when(
+      !is.na(LIFEFORM_DOMINANT) ~ LIFEFORM_DOMINANT,
+      ACCEPTED_SCIENTIFIC_NAME %in% names(lifeform_lookup) ~
+        lifeform_lookup[ACCEPTED_SCIENTIFIC_NAME],
+      TRUE ~ "Unknown"
+    ),
+    GIS_ACRES = replace_na(GIS_ACRES, median(GIS_ACRES, na.rm = TRUE)),
+    DISTANCE_TO_WATER_HORIZONTAL = replace_na(
+      DISTANCE_TO_WATER_HORIZONTAL,
+      median(DISTANCE_TO_WATER_HORIZONTAL, na.rm = TRUE)
+    )
+  ) |>
+
+  # Step 6: Extract polygon centroids for SDM point input
+  mutate(
+    lon = st_coordinates(st_centroid(SHAPE))[, 1],
+    lat = st_coordinates(st_centroid(SHAPE))[, 2]
+  ) |>
+  filter(!is.na(lon), !is.na(lat)) |>
+
+  # Step 7: Reproject to WGS84 (matches WorldClim)
+  st_transform(crs = 4326)
+
+invasive_df <- invasive_va |> st_drop_geometry()
+
+cat("Records after cleaning:", nrow(invasive_df), "\n")
+```
+
+```{r cleaning-checks}
+# Spot-check: coordinate bounds
+invasive_df |>
+  summarise(
+    lon_min    = round(min(lon), 2),
+    lon_max    = round(max(lon), 2),
+    lat_min    = round(min(lat), 2),
+    lat_max    = round(max(lat), 2),
+    n_outside  = sum(lon < -83.7 | lon > -75.2 | lat < 36.5 | lat > 39.5)
+  )
+
+# Remaining NAs (OWNER_NAME / FS_UNIT_NAME are expected — not imputed)
+invasive_df |>
+  summarise(across(everything(), ~ sum(is.na(.)))) |>
+  pivot_longer(everything(), names_to = "col", values_to = "na_count") |>
+  filter(na_count > 0)
+```
+
+---
+
+# 3. Climate Data
+
+```{r climate}
+va_clim <- worldclim_tile(var = "bio", lon = -79, lat = 38, res = 0.5, path = "data/")
+
+# Crop to Virginia extent and select 4 predictors
+va_clim_crop <- rast(sources(va_clim[[1]])[1]) |>
+  crop(ext(-83.7, -75.2, 36.5, 39.5))
+
+va_clim_crop <- va_clim_crop[[c(1, 4, 12, 15)]]
+names(va_clim_crop) <- c("bio1_mean_temp", "bio4_temp_seasonality",
+                          "bio12_annual_precip", "bio15_precip_seasonality")
+
+cat("Climate layers:", paste(names(va_clim_crop), collapse = ", "), "\n")
+```
+
+---
+
+# 4. Focal Species
+
+```{r focal-species}
+focal_species <- c(
+  "Ailanthus altissima",   # Tree        — most records
+  "Microstegium vimineum", # Graminoid   — shade-tolerant forest grass
+  "Rosa multiflora"        # Shrub       — open-to-edge disturbed areas
+)
+
+# Filter and extract climate at centroid locations
+focal_pts_vect <- invasive_df |>
+  filter(ACCEPTED_SCIENTIFIC_NAME %in% focal_species) |>
+  select(lon, lat) |>
+  vect(geom = c("lon", "lat"), crs = "EPSG:4326")
+
+climate_vals <- terra::extract(va_clim_crop, focal_pts_vect, ID = FALSE)
+
+focal_df <- invasive_df |>
+  filter(ACCEPTED_SCIENTIFIC_NAME %in% focal_species) |>
+  bind_cols(climate_vals)
+
+# Per-species summary
+focal_df |>
+  group_by(ACCEPTED_SCIENTIFIC_NAME) |>
+  summarise(
+    n                = n(),
+    lifeform         = first(LIFEFORM_DOMINANT),
+    mean_temp_C      = round(mean(bio1_mean_temp,        na.rm = TRUE) / 10, 1),
+    annual_precip_mm = round(mean(bio12_annual_precip,   na.rm = TRUE), 0),
+    temp_seasonality = round(mean(bio4_temp_seasonality, na.rm = TRUE), 0)
+  )
+```
+
+---
+
+# 5. Figures
+
+## Figure 1: Top species occurrence counts + regional rank breakdown
+
+```{r figure1, fig.height=8}
+# ── Panel A: Top 10 species by record count ──────────────────────────────────
+top10 <- invasive_df |>
+  count(ACCEPTED_SCIENTIFIC_NAME, sort = TRUE) |>
+  slice_head(n = 10) |>
+  mutate(
+    is_focal = ACCEPTED_SCIENTIFIC_NAME %in% focal_species,
+    label    = str_replace(ACCEPTED_SCIENTIFIC_NAME, " ", "\n")
+  )
+
+p_counts <- ggplot(top10, aes(x = n, y = reorder(ACCEPTED_SCIENTIFIC_NAME, n),
+                               fill = is_focal)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = comma(n)), hjust = -0.15, size = 3.2, color = "grey30") +
+  scale_fill_manual(values = c("TRUE" = "#E57200", "FALSE" = "#4A6FA5")) +
+  scale_x_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
+  scale_y_discrete(labels = function(x) str_replace(x, " ", "\n")) +
+  labs(
+    title    = "A  Top 10 invasive species by occurrence count",
+    subtitle = "Orange = focal species selected for SDM",
+    x        = "Occurrence records",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    axis.text.y   = element_text(face = "italic", size = 9),
+    panel.grid.major.y = element_blank()
+  )
+
+# ── Panel B: Species count by region and invasiveness rank ───────────────────
+p_rank <- vips_clean |>
+  pivot_longer(c(Mountain, Piedmont, Coastal),
+               names_to = "Region", values_to = "Present") |>
+  filter(Present == 1, !is.na(`VA Invasiveness Rank`)) |>
+  count(Region, `VA Invasiveness Rank`) |>
+  ggplot(aes(x = Region, y = n, fill = `VA Invasiveness Rank`)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = n), position = position_dodge(width = 0.9),
+            vjust = -0.4, size = 3) +
+  scale_fill_manual(
+    values = c("High" = "#C0392B", "Medium" = "#E67E22", "Low" = "#27AE60"),
+    name   = "Invasiveness\nRank"
+  ) +
+  labs(
+    title = "B  Species count by physiographic region and severity rank",
+    x     = NULL,
+    y     = "Number of species"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+# ── Panel C: Lifeform composition ────────────────────────────────────────────
+p_lifeform <- invasive_df |>
+  filter(LIFEFORM_DOMINANT != "Unknown") |>
+  count(LIFEFORM_DOMINANT, sort = TRUE) |>
+  mutate(pct = n / sum(n)) |>
+  ggplot(aes(x = reorder(LIFEFORM_DOMINANT, n), y = n, fill = LIFEFORM_DOMINANT)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = percent(pct, accuracy = 1)), hjust = -0.15, size = 3.2) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  coord_flip() +
+  labs(
+    title = "C  Records by lifeform category",
+    x     = NULL,
+    y     = "Occurrence records"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+(p_counts | p_rank) / p_lifeform +
+  plot_annotation(
+    title   = "Figure 1. Virginia Invasive Plant Species — Dataset Overview",
+    caption = "Source: USFS Bio_InvasivePlantCurrent.gdb; VIPS List Oct 2024",
+    theme   = theme(plot.title = element_text(size = 13, face = "bold"))
+  )
+```
+
+## Figure 2: Spatial distribution map
+
+```{r figure2, fig.height=7}
+# Virginia state boundary for context
+va_state <- tigris::states(cb = TRUE, progress_bar = FALSE) |>
+  filter(STUSPS == "VA") |>
+  st_transform(4326)
+
+# Hex-bin density map of all occurrence centroids
+tmap_mode("plot")
+
+tm_shape(va_state) +
+  tm_borders(col = "grey40", lwd = 1.5) +
+  tm_shape(invasive_va) +
+  tm_dots(
+    col       = "ACCEPTED_SCIENTIFIC_NAME",
+    palette   = "Dark2",
+    size      = 0.03,
+    alpha     = 0.4,
+    title     = "Species",
+    legend.show = FALSE        # too many species; legend added as inset
+  ) +
+  tm_layout(
+    main.title         = "Figure 2. Invasive Plant Distribution — Virginia National Forests (2019–2024)",
+    main.title.size    = 0.95,
+    main.title.fontface = "bold",
+    frame              = FALSE,
+    bg.color           = "white"
+  ) +
+  tm_compass(position = c("right", "top")) +
+  tm_scale_bar(position = c("left", "bottom"))
+```
+
+## Figure 3: Climate niche comparison across focal species
+
+```{r figure3, fig.height=7}
+focal_long <- focal_df |>
+  select(ACCEPTED_SCIENTIFIC_NAME,
+         bio1_mean_temp, bio4_temp_seasonality,
+         bio12_annual_precip, bio15_precip_seasonality) |>
+  mutate(bio1_mean_temp = bio1_mean_temp / 10) |>   # convert to °C
+  pivot_longer(
+    -ACCEPTED_SCIENTIFIC_NAME,
+    names_to  = "variable",
+    values_to = "value"
+  ) |>
+  mutate(
+    variable = recode(variable,
+      bio1_mean_temp           = "BIO1: Mean Annual\nTemperature (°C)",
+      bio4_temp_seasonality    = "BIO4: Temperature\nSeasonality",
+      bio12_annual_precip      = "BIO12: Annual\nPrecipitation (mm)",
+      bio15_precip_seasonality = "BIO15: Precipitation\nSeasonality"
+    ),
+    species_short = str_extract(ACCEPTED_SCIENTIFIC_NAME, "^\\w\\. \\w+|^\\w+") |>
+      str_replace("Ailanthus", "A. altissima") |>
+      str_replace("Microstegium", "M. vimineum") |>
+      str_replace("Rosa", "R. multiflora"),
+    species_short = case_when(
+      str_detect(ACCEPTED_SCIENTIFIC_NAME, "Ailanthus")    ~ "A. altissima",
+      str_detect(ACCEPTED_SCIENTIFIC_NAME, "Microstegium") ~ "M. vimineum",
+      str_detect(ACCEPTED_SCIENTIFIC_NAME, "Rosa")         ~ "R. multiflora"
+    )
+  )
+
+ggplot(focal_long, aes(x = species_short, y = value, fill = species_short)) +
+  geom_violin(alpha = 0.6, trim = TRUE, color = NA) +
+  geom_boxplot(width = 0.18, outlier.shape = NA, color = "grey20", fill = "white") +
+  scale_fill_manual(values = c(
+    "A. altissima"  = "#232D4B",
+    "M. vimineum"   = "#E57200",
+    "R. multiflora" = "#3a7d44"
+  )) +
+  facet_wrap(~ variable, scales = "free_y", nrow = 2) +
+  labs(
+    title    = "Figure 3. Bioclimatic Niche Profiles of Three Focal Invasive Species",
+    subtitle = "Violin + boxplot of climate values at occurrence centroids",
+    x        = NULL,
+    y        = "Climate variable value",
+    fill     = "Species",
+    caption  = "Source: WorldClim 2.1 (0.5 arcmin); USFS occurrence centroids"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    strip.text       = element_text(face = "bold", size = 10),
+    axis.text.x      = element_text(face = "italic", size = 9),
+    legend.position  = "none"
+  )
+```
+
+---
+
+# 6. Species Distribution Model (SDM)
+
+The SDM pipeline for each focal species:
+1. **Occurrences** — centroid points, spatially thinned (1 pt per raster cell)
+2. **Background** — 10,000 random points from within Virginia extent
+3. **Predictors** — 4 WorldClim bioclimatic layers
+4. **Model** — Random Forest classifier (presence vs. background)
+5. **Output** — habitat suitability raster (0–1) for each species
+
+```{r sdm-setup}
+# Virginia raster mask (1 = inside VA, NA = outside)
+va_vect  <- vect(va_state)
+va_mask  <- terra::rasterize(va_vect, va_clim_crop[[1]], field = 1)
+
+# Helper: thin occurrences to one point per raster cell
+thin_to_cell <- function(pts_df, rast) {
+  pts_vect   <- vect(pts_df, geom = c("lon", "lat"), crs = "EPSG:4326")
+  cell_ids   <- cellFromXY(rast, crds(pts_vect))
+  pts_df[!duplicated(cell_ids), ]
+}
+
+# Helper: generate background points within Virginia
+make_background <- function(mask, n = 10000, seed = 42) {
+  set.seed(seed)
+  bg <- spatSample(mask, size = n, method = "random", na.rm = TRUE, xy = TRUE)
+  names(bg)[1:2] <- c("lon", "lat")
+  bg
+}
+
+# Extract predictors and label 1/0 for a single species
+make_model_data <- function(species_name, focal_df, va_clim_crop, va_mask) {
+  # Presence
+  pres <- focal_df |>
+    filter(ACCEPTED_SCIENTIFIC_NAME == species_name) |>
+    thin_to_cell(va_clim_crop)
+
+  pres_pts  <- vect(pres[, c("lon","lat")], geom = c("lon","lat"), crs="EPSG:4326")
+  pres_vals <- terra::extract(va_clim_crop, pres_pts, ID = FALSE) |>
+    mutate(presence = 1L)
+
+  # Background
+  bg        <- make_background(va_mask)
+  bg_pts    <- vect(bg[, c("lon","lat")],  geom = c("lon","lat"), crs="EPSG:4326")
+  bg_vals   <- terra::extract(va_clim_crop, bg_pts, ID = FALSE) |>
+    mutate(presence = 0L)
+
+  bind_rows(pres_vals, bg_vals) |>
+    drop_na() |>
+    mutate(presence = factor(presence, levels = c(0, 1)))
+}
+```
+
+```{r sdm-run, cache=TRUE}
+# Run RF SDM for each focal species
+sdm_results <- map(focal_species, function(sp) {
+  cat("Fitting SDM:", sp, "\n")
+
+  model_data <- make_model_data(sp, focal_df, va_clim_crop, va_mask)
+
+  set.seed(123)
+  rf <- randomForest(
+    presence ~ bio1_mean_temp + bio4_temp_seasonality +
+               bio12_annual_precip + bio15_precip_seasonality,
+    data       = model_data,
+    ntree      = 500,
+    importance = TRUE
+  )
+
+  # Predict suitability across Virginia
+  suitability <- terra::predict(va_clim_crop, rf, type = "prob",
+                                 index = 2, na.rm = TRUE) * va_mask
+
+  list(species = sp, model = rf, suitability = suitability, data = model_data)
+})
+
+names(sdm_results) <- focal_species
+```
+
+## SDM diagnostics — variable importance
+
+```{r sdm-importance, fig.height=5}
+importance_df <- map_dfr(sdm_results, function(res) {
+  imp <- importance(res$model, type = 1)   # mean decrease accuracy
+  tibble(
+    species  = res$species,
+    variable = rownames(imp),
+    MDA      = imp[, 1]
+  )
+}) |>
+  mutate(
+    variable = recode(variable,
+      bio1_mean_temp           = "BIO1: Mean Temp",
+      bio4_temp_seasonality    = "BIO4: Temp Seasonality",
+      bio12_annual_precip      = "BIO12: Ann. Precip",
+      bio15_precip_seasonality = "BIO15: Precip Seasonality"
+    ),
+    species_short = case_when(
+      str_detect(species, "Ailanthus")    ~ "A. altissima",
+      str_detect(species, "Microstegium") ~ "M. vimineum",
+      str_detect(species, "Rosa")         ~ "R. multiflora"
+    )
+  )
+
+ggplot(importance_df, aes(x = reorder(variable, MDA), y = MDA, fill = species_short)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ species_short, ncol = 3) +
+  scale_fill_manual(values = c(
+    "A. altissima"  = "#232D4B",
+    "M. vimineum"   = "#E57200",
+    "R. multiflora" = "#3a7d44"
+  )) +
+  labs(
+    title   = "Variable Importance — Random Forest SDM",
+    subtitle = "Mean Decrease in Accuracy (higher = more important predictor)",
+    x = NULL, y = "Mean Decrease Accuracy"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title  = element_text(face = "bold"),
+    strip.text  = element_text(face = "bold.italic")
+  )
+```
+
+## Figure 4: Habitat Suitability Maps
+
+```{r figure4, fig.height=8}
+tmap_mode("plot")
+
+# Build one panel per species
+maps <- map(sdm_results, function(res) {
+  sp_short <- case_when(
+    str_detect(res$species, "Ailanthus")    ~ "Ailanthus altissima (Tree)",
+    str_detect(res$species, "Microstegium") ~ "Microstegium vimineum (Graminoid)",
+    str_detect(res$species, "Rosa")         ~ "Rosa multiflora (Shrub)"
+  )
+
+  tm_shape(res$suitability) +
+    tm_raster(
+      palette    = c("#f7f7f7", "#fee391", "#fd8d3c", "#bd0026"),
+      n          = 9,
+      style      = "cont",
+      title      = "Suitability",
+      breaks     = seq(0, 1, by = 0.2),
+      colorNA    = NULL
+    ) +
+  tm_shape(va_state) +
+    tm_borders(col = "grey30", lwd = 0.8) +
+  tm_layout(
+    main.title          = sp_short,
+    main.title.size     = 0.85,
+    main.title.fontface = "bold.italic",
+    frame               = FALSE,
+    legend.position     = c("right", "bottom"),
+    legend.text.size    = 0.7
+  )
+})
+
+tmap_arrange(maps[[1]], maps[[2]], maps[[3]], ncol = 1,
+             outer.margins = 0.02) |>
+  tmap_save_options() # comment out if running interactively
+
+# Print with title
+tmap_arrange(maps[[1]], maps[[2]], maps[[3]], ncol = 1)
+```
+
+---
+
+# 7. Summary Table
+
+```{r summary-table}
+map_dfr(sdm_results, function(res) {
+  # AUC proxy: OOB error from RF (1 - OOB is a rough accuracy)
+  oob_acc  <- 1 - res$model$err.rate[nrow(res$model$err.rate), "OOB"]
+
+  # Mean suitability across VA cells
+  suit_vals <- values(res$suitability, na.rm = TRUE)
+
+  tibble(
+    Species            = res$species,
+    N_occurrences      = sum(res$data$presence == 1),
+    N_background       = sum(res$data$presence == 0),
+    RF_OOB_accuracy    = round(oob_acc, 3),
+    Mean_suitability   = round(mean(suit_vals), 3),
+    High_suit_pct      = round(mean(suit_vals > 0.6) * 100, 1)
+  )
+}) |>
+  rename(
+    "Species"              = Species,
+    "Occurrence N"         = N_occurrences,
+    "Background N"         = N_background,
+    "OOB Accuracy"         = RF_OOB_accuracy,
+    "Mean Suitability"     = Mean_suitability,
+    "% Highly Suitable (>0.6)" = High_suit_pct
+  )
+```

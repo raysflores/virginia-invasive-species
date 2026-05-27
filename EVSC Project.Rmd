@@ -1,0 +1,475 @@
+---
+title: "Virginia Invasive Plant Species Analysis"
+author: "Ray Santiago and Seun Oladipo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cosmo
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    toc_depth: 3
+    df_print: paged
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Packages
+
+```{r cars, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readxl)
+library(scales)
+library(patchwork)
+
+# Spatial
+library(sf)
+library(terra)
+library(tmap)
+
+# Climate
+library(geodata)
+
+# SDM
+library(dismo)        # Bioclim + background sampling
+library(randomForest) # RF classifier for SDM
+```
+
+# Data Cleaning and Merging
+
+## Virginia invansive plants spreadsheet cleaning
+
+```{r vips-clean, echo=FALSE}
+vips_raw <- read_excel("vips-list-oct2024.xlsx", skip = 1)
+
+vips_clean <- vips_raw %>%
+  mutate(across(
+    c(Mountain, Piedmont, Coastal, Full, Partial, Shade, Hydric, Mesic, Xeric),
+    ~ as.integer(!is.na(.)))) %>%
+  mutate(`VA Invasiveness Rank` = str_trim(`VA Invasiveness Rank`)) %>%
+  drop_na(`Common Name`, `Scientific Name`)
+```
+
+## Load plant geodatabase
+
+```{r}
+# ── Lifeform lookup ───────────────────────────────────────────────────────────
+lifeform_lookup <- c(
+  "Ailanthus altissima"   = "Tree",       "Microstegium vimineum"  = "Graminoid",
+  "Rosa multiflora"       = "Shrub",      "Elaeagnus umbellata"    = "Shrub",
+  "Berberis thunbergii"   = "Shrub",      "Alliaria petiolata"     = "Forb/Herb",
+  "Lonicera japonica"     = "Vine",       "Lonicera maackii"       = "Shrub",
+  "Lonicera morrowii"     = "Shrub",      "Paulownia tomentosa"    = "Tree",
+  "Celastrus orbiculatus" = "Vine",       "Ligustrum vulgare"      = "Shrub",
+  "Lespedeza cuneata"     = "Forb/Herb",  "Phalaris arundinacea"   = "Graminoid",
+  "Tussilago farfara"     = "Forb/Herb",  "Leucanthemum vulgare"   = "Forb/Herb",
+  "Securigera varia"      = "Forb/Herb",  "Polygonum cespitosum"   = "Forb/Herb"
+  )
+
+# ── Load geodatabase ──────────────────────────────────────────────────────────
+va_bbox <- st_bbox(c(xmin=-83.7, ymin=36.5, xmax=-75.2, ymax=39.5), crs=st_crs(4326))
+
+invasive_sf <- st_read("Bio_InvasivePlantCurrent.gdb/", quiet = TRUE)
+
+cat("Raw records:", nrow(invasive_sf), "\n")
+
+```
+```{r}
+# — Load geodatabase —
+va_bbox <- st_bbox(c(xmin=-83.7, ymin=36.5, xmax=-75.2, ymax=39.5), crs=st_crs(4326))
+
+# Buffer the bbox slightly so wkt_filter doesn't clip edge polygons
+va_bbox_buf <- va_bbox %>%
+  st_as_sfc() %>%
+  st_buffer(0.2) %>%   # ~20km buffer so edge records aren't dropped
+  st_as_text()
+
+invasive_sf <- st_read(
+  "Bio_InvasivePlantCurrent.gdb/",
+  wkt_filter = va_bbox_buf,
+  quiet = TRUE
+)
+
+cat("Raw records:", nrow(invasive_sf), "\n")
+```
+
+
+```{r invasive-clean}
+invasive_va <- invasive_sf %>%
+  st_make_valid() %>%                          # skip is_valid check, make_valid is a no-op on valid geoms
+  dplyr::filter(!st_is_empty(st_geometry(.))) %>%   # much faster than is_valid
+  dplyr::select(
+    ACCEPTED_SCIENTIFIC_NAME, ACCEPTED_COMMON_NAME,
+    LIFEFORM_DOMINANT, GIS_ACRES, DATE_COLLECTED,
+    DISTANCE_TO_WATER_HORIZONTAL, SHAPE
+  ) %>%
+  dplyr::mutate(ACCEPTED_SCIENTIFIC_NAME = case_when(
+    str_detect(ACCEPTED_SCIENTIFIC_NAME, "Elaeagnus umbellata")  ~ "Elaeagnus umbellata",
+    str_detect(ACCEPTED_SCIENTIFIC_NAME, "Polygonum cespitosum") ~ "Polygonum cespitosum",
+    TRUE ~ ACCEPTED_SCIENTIFIC_NAME
+  )) %>%
+  # ---- FAST DEDUP: hash WKT instead of comparing geometries ----
+  dplyr::mutate(.geom_hash = sapply(st_as_text(st_geometry(.)), digest::digest)) %>%
+  dplyr::distinct(ACCEPTED_SCIENTIFIC_NAME, .geom_hash, .keep_all = TRUE) %>%
+  dplyr::select(-.geom_hash) %>%
+  # ---- rest of your mutates ----
+  dplyr::mutate(LIFEFORM_DOMINANT = case_when(
+    !is.na(LIFEFORM_DOMINANT)                           ~ LIFEFORM_DOMINANT,
+    ACCEPTED_SCIENTIFIC_NAME == "Ailanthus altissima"   ~ "Tree",
+    ACCEPTED_SCIENTIFIC_NAME == "Microstegium vimineum" ~ "Graminoid",
+    ACCEPTED_SCIENTIFIC_NAME == "Rosa multiflora"       ~ "Shrub",
+    ACCEPTED_SCIENTIFIC_NAME == "Elaeagnus umbellata"   ~ "Shrub",
+    ACCEPTED_SCIENTIFIC_NAME == "Berberis thunbergii"   ~ "Shrub",
+    ACCEPTED_SCIENTIFIC_NAME == "Alliaria petiolata"    ~ "Forb/Herb",
+    ACCEPTED_SCIENTIFIC_NAME == "Lonicera japonica"     ~ "Vine",
+    ACCEPTED_SCIENTIFIC_NAME == "Lonicera maackii"      ~ "Shrub",
+    ACCEPTED_SCIENTIFIC_NAME == "Lonicera morrowii"     ~ "Shrub",
+    ACCEPTED_SCIENTIFIC_NAME == "Paulownia tomentosa"   ~ "Tree",
+    ACCEPTED_SCIENTIFIC_NAME == "Celastrus orbiculatus" ~ "Vine",
+    ACCEPTED_SCIENTIFIC_NAME == "Ligustrum vulgare"     ~ "Shrub",
+    ACCEPTED_SCIENTIFIC_NAME == "Lespedeza cuneata"     ~ "Forb/Herb",
+    ACCEPTED_SCIENTIFIC_NAME == "Phalaris arundinacea"  ~ "Graminoid",
+    ACCEPTED_SCIENTIFIC_NAME == "Tussilago farfara"     ~ "Forb/Herb",
+    ACCEPTED_SCIENTIFIC_NAME == "Leucanthemum vulgare"  ~ "Forb/Herb",
+    ACCEPTED_SCIENTIFIC_NAME == "Securigera varia"      ~ "Forb/Herb",
+    TRUE                                                ~ "Unknown"
+  )) %>%
+  dplyr::mutate(
+    GIS_ACRES = ifelse(is.na(GIS_ACRES), median(GIS_ACRES, na.rm = TRUE), GIS_ACRES),
+    DISTANCE_TO_WATER_HORIZONTAL = ifelse(
+      is.na(DISTANCE_TO_WATER_HORIZONTAL),
+      median(DISTANCE_TO_WATER_HORIZONTAL, na.rm = TRUE),
+      DISTANCE_TO_WATER_HORIZONTAL)
+  ) %>%
+  st_transform(crs = 4326)
+
+# Extract coords AFTER transform (same as before)
+coords      <- st_coordinates(st_centroid(st_geometry(invasive_va)))
+invasive_va <- invasive_va %>%
+  dplyr::mutate(lon = coords[, 1], lat = coords[, 2]) %>%
+  dplyr::filter(!is.na(lon), !is.na(lat),
+                between(lon, -83.7, -75.2),
+                between(lat,  36.5,  39.5))
+
+rm(invasive_sf); gc()
+cat("Records after cleaning:", nrow(invasive_va), "\n")
+```
+
+
+```{r clip-to-virginia}
+va_boundary <- geodata::gadm("USA", level = 1, path = "data/") %>%
+  sf::st_as_sf() %>%
+  dplyr::filter(NAME_1 == "Virginia") %>%
+  sf::st_transform(crs = 4326)
+
+invasive_va <- invasive_va %>%
+  sf::st_filter(va_boundary)
+
+cat("Records within Virginia:", nrow(invasive_va), "\n")
+```
+
+
+```{r focal-species}
+focal_species     <- c("Ailanthus altissima", "Microstegium vimineum", "Rosa multiflora")
+invasive_focal    <- invasive_va %>% dplyr::filter(ACCEPTED_SCIENTIFIC_NAME %in% focal_species)
+invasive_focal_df <- invasive_focal %>% sf::st_drop_geometry()
+
+invasive_focal_df %>%
+  dplyr::group_by(ACCEPTED_SCIENTIFIC_NAME) %>%
+  dplyr::summarise(n = n(), lifeform = first(LIFEFORM_DOMINANT),
+                   mean_acres = round(mean(GIS_ACRES, na.rm = TRUE), 1))
+```
+
+## Climate data
+
+```{r climate-load}
+va_clim <- worldclim_tile(
+  var  = "bio",
+  lon  = -79,
+  lat  = 38,
+  res  = 0.5,
+  path = "data/"
+)
+
+# Read full tile directly — bypass global() entirely
+bio_path <- sources(va_clim[[1]])[1]
+va_clim_crop <- rast(bio_path) |>
+  crop(ext(-83.7, -75.2, 36.5, 39.5))
+
+# Select and name the 4 layers we need
+va_clim_crop <- va_clim_crop[[c(1, 4, 12, 15)]]
+names(va_clim_crop) <- c("bio1_mean_temp", "bio4_temp_seasonality",
+                          "bio12_annual_precip", "bio15_precip_seasonality")
+
+cat("Layers:", names(va_clim_crop), "\n")
+cat("Extent:", as.character(ext(va_clim_crop)), "\n")
+cat("CRS:", crs(va_clim_crop, describe = TRUE)$name, "\n")
+```
+
+```{r climate-extract}
+focal_pts    <- vect(invasive_focal_df[, c("lon","lat")], geom = c("lon","lat"), crs = "EPSG:4326")
+climate_vals <- terra::extract(va_clim_crop, focal_pts, ID = FALSE)
+invasive_focal_df <- dplyr::bind_cols(invasive_focal_df, climate_vals) %>%
+  dplyr::filter(complete.cases(dplyr::select(., starts_with("bio"))))
+cat("Records with climate data:", nrow(invasive_focal_df), "\n")
+```
+
+
+```{r predictor-extraction}
+# Reset — rebuild from the clean sf object to remove the duplicate columns
+invasive_focal_df <- invasive_focal %>% st_drop_geometry()
+
+# Build points SpatVector from lon/lat columns
+focal_pts <- invasive_focal_df %>%
+  select(lon, lat) %>%
+  vect(geom = c("lon", "lat"), crs = "EPSG:4326")
+
+# Confirm row counts match
+cat("Occurrence points:", nrow(focal_pts), "\n")
+cat("Focal dataframe:  ", nrow(invasive_focal_df), "\n")
+
+# Extract climate values
+climate_vals <- terra::extract(
+  va_clim_crop,
+  focal_pts,
+  ID = FALSE
+)
+
+# Bind once cleanly
+invasive_focal_df <- bind_cols(invasive_focal_df, climate_vals)
+
+# Verify — should have exactly 15 columns, clean names
+cat("Columns:", ncol(invasive_focal_df), "\n")
+names(invasive_focal_df)
+
+# Check NAs
+invasive_focal_df %>%
+  select(bio1_mean_temp, bio4_temp_seasonality,
+         bio12_annual_precip, bio15_precip_seasonality) %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  print()
+
+# Species climate summary
+invasive_focal_df %>%
+  group_by(ACCEPTED_SCIENTIFIC_NAME) %>%
+  summarise(
+    mean_temp_C      = round(mean(bio1_mean_temp,        na.rm = TRUE) / 10, 1),
+    annual_precip_mm = round(mean(bio12_annual_precip,   na.rm = TRUE), 0),
+    temp_seasonality = round(mean(bio4_temp_seasonality, na.rm = TRUE), 0)
+  )
+```
+
+
+```{r sdm-analysis}
+
+
+# ── Climate raster ────────────────────────────────────────────────────────────
+va_clim_crop <- worldclim_tile(var="bio", lon=-79, lat=38, res=0.5, path="data/")
+va_clim_crop <- rast(sources(va_clim_crop[[1]])[1]) %>%
+  crop(ext(-83.7,-75.2,36.5,39.5))
+va_clim_crop <- va_clim_crop[[c(1,4,12,15)]]
+names(va_clim_crop) <- c("bio1_mean_temp","bio4_temp_seasonality",
+                          "bio12_annual_precip","bio15_precip_seasonality")
+
+# ── Climate extraction onto focal species ─────────────────────────────────────
+focal_pts    <- vect(invasive_focal_df[,c("lon","lat")], geom=c("lon","lat"), crs="EPSG:4326")
+climate_vals <- terra::extract(va_clim_crop, focal_pts, ID=FALSE)
+invasive_focal_df <- dplyr::bind_cols(
+  invasive_focal_df %>% dplyr::select(-any_of(names(va_clim_crop))),
+  climate_vals
+) %>% dplyr::filter(complete.cases(dplyr::select(., all_of(names(va_clim_crop)))))
+cat("Focal records with climate:", nrow(invasive_focal_df), "\n")
+
+# ── Background points ─────────────────────────────────────────────────────────
+set.seed(2024)
+pred_cols <- names(va_clim_crop)
+bg_pts <- terra::spatSample(va_clim_crop, size=10000, method="random",
+                             xy=TRUE, na.rm=TRUE) %>%
+  as.data.frame() %>%
+  dplyr::rename(lon=x, lat=y)
+
+# ── Random Forest SDM ─────────────────────────────────────────────────────────
+rf_models <- lapply(focal_species, function(sp) {
+  pres <- invasive_focal_df %>%
+    dplyr::filter(ACCEPTED_SCIENTIFIC_NAME==sp) %>%
+    dplyr::select(all_of(pred_cols)) %>%
+    dplyr::mutate(presence=1L)
+  bg <- bg_pts %>%
+    dplyr::select(all_of(pred_cols)) %>%
+    dplyr::mutate(presence=0L)
+  df <- dplyr::bind_rows(pres, bg) %>%
+    dplyr::mutate(presence=as.factor(presence))
+  n <- sum(df$presence==1)
+  randomForest(presence~., data=df, ntree=300,
+               importance=TRUE, sampsize=c("0"=n,"1"=n))
+})
+names(rf_models) <- focal_species
+
+# ── Model accuracy ────────────────────────────────────────────────────────────
+cat("\n=== Model Accuracy ===\n")
+lapply(focal_species, function(sp) {
+  oob <- rf_models[[sp]]$err.rate[300,"OOB"]
+  cat(sp, "| OOB error:", round(oob,3), "| Accuracy:", round(1-oob,3), "\n")
+})
+
+# ── Variable importance ───────────────────────────────────────────────────────
+var_labels <- c("bio1_mean_temp"           = "Mean Temp (bio1)",
+                "bio4_temp_seasonality"    = "Temp Seasonality (bio4)",
+                "bio12_annual_precip"      = "Annual Precip (bio12)",
+                "bio15_precip_seasonality" = "Precip Seasonality (bio15)")
+
+vi_df <- do.call(rbind, lapply(focal_species, function(sp) {
+  imp <- importance(rf_models[[sp]], type=1)
+  data.frame(species  = sp,
+             variable = var_labels[rownames(imp)],
+             importance = imp[,"MeanDecreaseAccuracy"])
+}))
+cat("\n=== Variable Importance ===\n")
+print(vi_df %>% dplyr::arrange(species, desc(importance)))
+
+# ── Climate niche per species ─────────────────────────────────────────────────
+cat("\n=== Climate Niche Summary ===\n")
+invasive_focal_df %>%
+  dplyr::group_by(ACCEPTED_SCIENTIFIC_NAME) %>%
+  dplyr::summarise(
+    n              = n(),
+    mean_temp_C    = round(mean(bio1_mean_temp,      na.rm=TRUE), 1),
+    sd_temp        = round(sd(bio1_mean_temp,        na.rm=TRUE), 2),
+    mean_precip_mm = round(mean(bio12_annual_precip, na.rm=TRUE), 0),
+    sd_precip      = round(sd(bio12_annual_precip,   na.rm=TRUE), 0)
+  )
+
+# ── Statistical tests ─────────────────────────────────────────────────────────
+cat("\n=== Kruskal-Wallis: Temperature ===\n")
+kruskal.test(bio1_mean_temp ~ ACCEPTED_SCIENTIFIC_NAME, data=invasive_focal_df) %>% print()
+
+cat("\n=== Kruskal-Wallis: Precipitation ===\n")
+kruskal.test(bio12_annual_precip ~ ACCEPTED_SCIENTIFIC_NAME, data=invasive_focal_df) %>% print()
+
+cat("\n=== Pairwise Wilcoxon: Temperature ===\n")
+pairwise.wilcox.test(invasive_focal_df$bio1_mean_temp,
+                     invasive_focal_df$ACCEPTED_SCIENTIFIC_NAME,
+                     p.adjust.method="bonferroni") %>% print()
+
+# ── County hotspots ───────────────────────────────────────────────────────────
+cat("\n=== Top 10 Counties by Invasion Pressure ===\n")
+va_counties <- geodata::gadm("USA", level=2, path="data/") %>%
+  sf::st_as_sf() %>%
+  dplyr::filter(NAME_1=="Virginia") %>%
+  sf::st_transform(crs=4326)
+
+sf::st_join(invasive_va, va_counties) %>%
+  sf::st_drop_geometry() %>%
+  dplyr::count(NAME_2, sort=TRUE) %>%
+  dplyr::rename(county=NAME_2, n_invasive=n) %>%
+  head(10) %>% print()
+```
+
+
+# **Figures**
+
+## Figure 1: Time Series
+
+
+```{r figures}
+# Define these first — used across all panels
+invasive_va_df <- invasive_va %>% sf::st_drop_geometry()
+lifeform_colours <- c("Tree"="darkgreen","Shrub"="#e67e22",
+                      "Graminoid"="#f1c40f","Vine"="#8e44ad",
+                      "Forb/Herb"="#e74c3c","Unknown"="grey60")
+
+# Panel 1: Detections over time
+p1 <- invasive_va %>%
+  sf::st_drop_geometry() %>%
+  dplyr::mutate(year = lubridate::year(DATE_COLLECTED)) %>%
+  dplyr::filter(!is.na(year), year >= 2015, year <= 2024) %>%
+  dplyr::count(year, LIFEFORM_DOMINANT) %>%
+  ggplot(aes(x = year, y = n, colour = LIFEFORM_DOMINANT)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  scale_colour_manual(values = lifeform_colours, name = "Lifeform") +
+  scale_x_continuous(breaks = 2015:2024) +
+  labs(title = "Panel 1: Invasive Plant Detections Over Time — Virginia",
+       x = NULL, y = "# Occurrence Records") +
+  theme_minimal(base_size = 11)
+
+# Panel 2: Top 10 species
+p2 <- invasive_va_df %>%
+  dplyr::count(ACCEPTED_SCIENTIFIC_NAME, sort = TRUE) %>%
+  head(10) %>%
+  ggplot(aes(x = n, y = reorder(ACCEPTED_SCIENTIFIC_NAME, n), fill = n)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_gradient(low = "#9ecfa8", high = "#1c3a24") +
+  scale_x_continuous(expand = c(0,0)) +
+  labs(title = "Panel 2: Top 10 Invasive Species in Virginia",
+       x = "# Occurrences", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.y = element_text(face = "italic"))
+
+
+p3 <- vips_clean %>%
+  tidyr::pivot_longer(c(Mountain, Piedmont, Coastal),
+                      names_to = "region", values_to = "present") %>%
+  dplyr::filter(present == 1, !is.na(`VA Invasiveness Rank`)) %>%
+  ggplot(aes(x = region, fill = `VA Invasiveness Rank`)) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("High"="red3","Medium"="#c9742a","Low"="#3a7d44"),
+                    name = "Invasiveness\nRank") +
+  labs(title = "Panel 3: Species by Region & Invasiveness Rank",
+       x = NULL, y = "# Species") +
+  theme_minimal(base_size = 11)
+
+p1 / p2 / p3
+```
+
+## Figure 2: Map
+```{r Figure 1}
+
+invasive_va_df <- invasive_va %>% st_drop_geometry()
+
+lifeform_colours <- c("Tree"="darkgreen","Shrub"="#e67e22",
+                       "Graminoid"="#f1c40f","Vine"="#8e44ad",
+                       "Forb/Herb"="#e74c3c","Unknown"="grey60")
+
+fig1 <- ggplot() +
+  geom_sf(data = va_boundary, fill = "#f0ede6", colour = "grey50", linewidth = 0.4) +
+  geom_point(data = invasive_va_df,
+             aes(x = lon, y = lat, colour = LIFEFORM_DOMINANT),
+             size = 0.8, alpha = 0.6) +
+  scale_colour_manual(values = lifeform_colours, name = "Lifeform") +
+  coord_sf(xlim = c(-83.7,-75.2), ylim = c(36.5,39.5), expand = FALSE) +
+  labs(title = "Figure 1: Invasive Plant Species Occurrences in Virginia",
+       caption = "Source: USFS Bio_InvasivePlantCurrent GDB") +
+  theme_minimal(base_size = 12) +
+  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1)))
+print(fig1)
+```
+
+
+Figure 3 - top 15 species bar chart
+
+```{r figure2}
+
+fig2 <- invasive_va_df %>%
+  dplyr::count(ACCEPTED_SCIENTIFIC_NAME, LIFEFORM_DOMINANT, sort = TRUE) %>%
+  head(15) %>%
+  ggplot(aes(x = n, y = reorder(ACCEPTED_SCIENTIFIC_NAME, n), fill = LIFEFORM_DOMINANT)) +
+  geom_col() +
+  scale_fill_manual(values = lifeform_colours, name = "Lifeform") +
+  scale_x_continuous(expand = c(0,0)) +
+  labs(title = "Figure 2: Top 15 Invasive Species by Occurrence Count",
+       x = "Number of Records", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_text(face = "italic"))
+print(fig2)
+```
+
+
+## Supplemental: Interactive map
+
+
