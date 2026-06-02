@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mapping Invasive Alien Plant Species — Project Workflow</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --green: #39d353;
+    --green-dim: #1a4a2e;
+    --teal: #00b4d8;
+    --teal-dim: #0a2a33;
+    --amber: #f5a623;
+    --amber-dim: #3a2800;
+    --red: #f85149;
+    --red-dim: #3a0f0e;
+    --purple: #bc8cff;
+    --purple-dim: #2a1a4a;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --connector: #30363d;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    min-height: 100vh;
+    padding: 40px 20px 60px;
+  }
+
+  header {
+    text-align: center;
+    margin-bottom: 50px;
+  }
+
+  header h1 {
+    font-family: 'Space Mono', monospace;
+    font-size: clamp(1rem, 2.5vw, 1.4rem);
+    color: var(--green);
+    letter-spacing: 0.05em;
+    line-height: 1.4;
+    text-transform: uppercase;
+  }
+
+  header p {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    margin-top: 8px;
+    font-family: 'Space Mono', monospace;
+  }
+
+  .diagram {
+    max-width: 1100px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    align-items: center;
+  }
+
+  /* ── Phase labels ── */
+  .phase-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    width: 100%;
+    position: relative;
+  }
+
+  .phase-label {
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    transform: rotate(180deg);
+    font-family: 'Space Mono', monospace;
+    font-size: 0.6rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    border-left: 2px solid var(--border);
+    padding: 12px 6px;
+    min-width: 28px;
+    align-self: stretch;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .phase-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px 0;
+  }
+
+  /* ── Node cards ── */
+  .node-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .node {
+    border-radius: 8px;
+    padding: 14px 18px;
+    border: 1px solid;
+    position: relative;
+    transition: transform 0.15s, box-shadow 0.15s;
+    cursor: default;
+  }
+
+  .node:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  }
+
+  .node-title {
+    font-size: 0.78rem;
+    font-weight: 600;
+    font-family: 'Space Mono', monospace;
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .node-body {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    line-height: 1.5;
+  }
+
+  .node-badge {
+    font-size: 0.6rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: 'Space Mono', monospace;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+  }
+
+  /* Parallelogram shape for data nodes */
+  .node-data {
+    clip-path: polygon(8px 0%, 100% 0%, calc(100% - 8px) 100%, 0% 100%);
+    border-radius: 0;
+  }
+
+  /* Colors per type */
+  .c-green { background: var(--green-dim); border-color: var(--green); }
+  .c-green .node-title { color: var(--green); }
+  .c-green .node-badge { background: var(--green); color: #000; }
+
+  .c-teal { background: var(--teal-dim); border-color: var(--teal); }
+  .c-teal .node-title { color: var(--teal); }
+  .c-teal .node-badge { background: var(--teal); color: #000; }
+
+  .c-amber { background: var(--amber-dim); border-color: var(--amber); }
+  .c-amber .node-title { color: var(--amber); }
+  .c-amber .node-badge { background: var(--amber); color: #000; }
+
+  .c-red { background: var(--red-dim); border-color: var(--red); }
+  .c-red .node-title { color: var(--red); }
+  .c-red .node-badge { background: var(--red); color: #fff; }
+
+  .c-purple { background: var(--purple-dim); border-color: var(--purple); }
+  .c-purple .node-title { color: var(--purple); }
+  .c-purple .node-badge { background: var(--purple); color: #000; }
+
+  /* ── Connectors ── */
+  .connector {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    padding: 4px 0;
+  }
+
+  .arrow-line {
+    width: 2px;
+    background: var(--connector);
+    flex: 1;
+    min-height: 20px;
+  }
+
+  .arrow-head {
+    width: 0;
+    height: 0;
+    border-left: 6px solid transparent;
+    border-right: 6px solid transparent;
+    border-top: 9px solid var(--connector);
+  }
+
+  .connector-label {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.58rem;
+    color: var(--text-muted);
+    background: var(--bg);
+    padding: 2px 6px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    margin: 4px 0;
+    text-align: center;
+  }
+
+  /* ── Wide connector (multi-branch) ── */
+  .multi-connect {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%;
+    padding: 8px 0;
+  }
+
+  .multi-connect .top-line {
+    width: 2px;
+    height: 16px;
+    background: var(--connector);
+  }
+
+  .multi-connect .h-bar {
+    height: 2px;
+    background: var(--connector);
+    width: 70%;
+  }
+
+  .multi-connect .drops {
+    display: flex;
+    width: 70%;
+    justify-content: space-around;
+  }
+
+  .multi-connect .drop {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .multi-connect .drop-line {
+    width: 2px;
+    height: 20px;
+    background: var(--connector);
+  }
+
+  .multi-connect .drop-head {
+    width: 0;
+    height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 7px solid var(--connector);
+  }
+
+  /* ── Decision diamond ── */
+  .diamond-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .diamond {
+    width: 120px;
+    height: 60px;
+    background: var(--amber-dim);
+    border: 1px solid var(--amber);
+    transform: perspective(200px) rotateX(10deg);
+    clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .diamond-text {
+    font-size: 0.65rem;
+    font-family: 'Space Mono', monospace;
+    color: var(--amber);
+    text-align: center;
+    transform: perspective(200px) rotateX(-10deg);
+    clip-path: none;
+  }
+
+  /* width helpers */
+  .w-sm { width: 180px; min-width: 180px; }
+  .w-md { width: 220px; min-width: 220px; }
+  .w-lg { width: 280px; min-width: 280px; }
+  .w-xl { width: 340px; min-width: 280px; }
+  .w-full { width: 100%; }
+
+  /* ── Legend ── */
+  .legend {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+    margin-top: 40px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    font-family: 'Space Mono', monospace;
+  }
+
+  .legend-swatch {
+    width: 14px;
+    height: 14px;
+    border-radius: 3px;
+    border: 1px solid;
+  }
+
+  /* ── Gap notes ── */
+  .gap-note {
+    font-size: 0.7rem;
+    color: var(--red);
+    font-family: 'Space Mono', monospace;
+    border: 1px dashed var(--red);
+    border-radius: 4px;
+    padding: 3px 8px;
+    background: var(--red-dim);
+    margin-top: 4px;
+    display: inline-block;
+  }
+
+  /* ── Decision box ── */
+  .decision {
+    border-radius: 0;
+    clip-path: polygon(16px 0%, calc(100% - 16px) 0%, 100% 50%, calc(100% - 16px) 100%, 16px 100%, 0% 50%);
+    padding: 14px 32px;
+  }
+
+  /* divider between phases */
+  .phase-divider {
+    width: 100%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--border), transparent);
+    margin: 8px 0;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Mapping Invasive Alien Plant Species<br>Across Virginia, United States</h1>
+  <p>Authors: Raymond Santiago &amp; Seun Oladipo &nbsp;|&nbsp; EVSC 4080/7080 Spring 2026 &nbsp;|&nbsp; Project Workflow Diagram</p>
+</header>
+
+<div class="diagram">
+
+  <!-- ════ PHASE 1: DATA ACQUISITION ════ -->
+  <div class="phase-row">
+    <div class="phase-label" style="border-color: var(--green);">1 — Data Acquisition</div>
+    <div class="phase-content">
+      <div class="node-row">
+        <!-- Data sources -->
+        <div class="node c-green w-md node-data">
+          <div class="node-title"><span class="node-badge">INPUT</span> Virginia Boundary</div>
+          <div class="node-body">ESRI Living Atlas<br>Study area boundary</div>
+        </div>
+        <div class="node c-green w-md node-data">
+          <div class="node-title"><span class="node-badge">INPUT</span> Land Use / Land Cover</div>
+          <div class="node-body">ESRI API · 2m resolution<br>2017–2023 temporal range</div>
+        </div>
+        <div class="node c-green w-md node-data">
+          <div class="node-title"><span class="node-badge">INPUT</span> Climate Variables</div>
+          <div class="node-body">NOAA: Temperature &amp; Precipitation<br>1851–Present · Global<br><span class="gap-note">⚠ Not yet downloaded</span></div>
+        </div>
+        <div class="node c-green w-md node-data">
+          <div class="node-title"><span class="node-badge">INPUT</span> Species Distribution</div>
+          <div class="node-body">iNaturalist · GBIF · VA DCR<br>Invasive plant occurrences<br><span class="gap-note">⚠ Major gap — limited data found</span></div>
+        </div>
+      </div>
+      <div class="node-row" style="margin-top:8px;">
+        <div class="node c-amber w-xl decision">
+          <div class="node-title">🔀 Data Pivot Decision</div>
+          <div class="node-body">If invasive species data remains insufficient → pivot to <strong>endangered / vulnerable / extinct plant species</strong> (same spatial analysis framework applies)</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- connector -->
+  <div class="connector" style="height:40px;">
+    <div class="arrow-line"></div>
+    <div class="connector-label">Load into R</div>
+    <div class="arrow-head"></div>
+  </div>
+
+  <!-- ════ PHASE 2: DATA PREPROCESSING ════ -->
+  <div class="phase-row">
+    <div class="phase-label" style="border-color: var(--teal);">2 — Preprocessing</div>
+    <div class="phase-content">
+      <div class="node-row">
+        <div class="node c-teal w-md">
+          <div class="node-title"><span class="node-badge">PROC</span> Boundary Clipping</div>
+          <div class="node-body">Clip all raster &amp; vector layers to Virginia extent using <code>sf</code> / <code>terra</code></div>
+        </div>
+        <div class="node c-teal w-md">
+          <div class="node-title"><span class="node-badge">PROC</span> CRS Alignment</div>
+          <div class="node-body">Reproject all layers to common CRS (e.g. EPSG:4326 or VA state plane)</div>
+        </div>
+        <div class="node c-teal w-md">
+          <div class="node-title"><span class="node-badge">PROC</span> LULC Integration</div>
+          <div class="node-body">Load ESRI LULC via API or local tile<br><span class="gap-note">⚠ Unclear how to load in R</span></div>
+        </div>
+        <div class="node c-teal w-md">
+          <div class="node-title"><span class="node-badge">PROC</span> Species Filtering</div>
+          <div class="node-body">Filter GBIF / iNaturalist records to invasive taxa in Virginia bounding box</div>
+        </div>
+      </div>
+      <div class="node-row" style="margin-top:10px;">
+        <div class="node c-teal w-md">
+          <div class="node-title"><span class="node-badge">PROC</span> Temporal Aggregation</div>
+          <div class="node-body">Match climate data temporal resolution to LULC observation windows (annual/seasonal)</div>
+        </div>
+        <div class="node c-teal w-md">
+          <div class="node-title"><span class="node-badge">PROC</span> Raster Resampling</div>
+          <div class="node-body">Harmonize spatial resolution across layers (snap to 30m or 2m grid)</div>
+        </div>
+        <div class="node c-teal w-md">
+          <div class="node-title"><span class="node-badge">PROC</span> Remove Duplicates</div>
+          <div class="node-body">De-duplicate occurrence records; thin spatial sampling bias</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- connector -->
+  <div class="connector" style="height:40px;">
+    <div class="arrow-line"></div>
+    <div class="connector-label">Cleaned, aligned dataset</div>
+    <div class="arrow-head"></div>
+  </div>
+
+  <!-- ════ PHASE 3: EXPLORATORY ANALYSIS ════ -->
+  <div class="phase-row">
+    <div class="phase-label" style="border-color: var(--purple);">3 — Exploratory Analysis</div>
+    <div class="phase-content">
+      <div class="node-row">
+        <div class="node c-purple w-md">
+          <div class="node-title"><span class="node-badge">EDA</span> Occurrence Mapping</div>
+          <div class="node-body">Map species point records against VA boundary — visualize spatial clustering</div>
+        </div>
+        <div class="node c-purple w-md">
+          <div class="node-title"><span class="node-badge">EDA</span> LULC Class Distribution</div>
+          <div class="node-body">Tabulate &amp; visualize LULC class areas across Virginia for 2017–2023</div>
+        </div>
+        <div class="node c-purple w-md">
+          <div class="node-title"><span class="node-badge">EDA</span> Climate Summary</div>
+          <div class="node-body">Summarize temperature &amp; precipitation distributions by region / season</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- multi-branch connector -->
+  <div class="multi-connect">
+    <div class="top-line"></div>
+    <div class="h-bar"></div>
+    <div class="drops">
+      <div class="drop"><div class="drop-line"></div><div class="drop-head"></div></div>
+      <div class="drop"><div class="drop-line"></div><div class="drop-head"></div></div>
+      <div class="drop"><div class="drop-line"></div><div class="drop-head"></div></div>
+    </div>
+  </div>
+
+  <!-- ════ PHASE 4: CORE ANALYSIS ════ -->
+  <div class="phase-row">
+    <div class="phase-label" style="border-color: var(--amber);">4 — Core Analysis</div>
+    <div class="phase-content">
+      <div class="node-row">
+        <div class="node c-amber w-md">
+          <div class="node-title"><span class="node-badge">ANALYSIS</span> Species–LULC Overlay</div>
+          <div class="node-body">Extract LULC class at each species occurrence point<br><em>Dep var:</em> presence/absence<br><em>Indep:</em> LULC class, year</div>
+        </div>
+        <div class="node c-amber w-md">
+          <div class="node-title"><span class="node-badge">ANALYSIS</span> Climate–Occurrence Relationship</div>
+          <div class="node-body">Correlate temperature &amp; precipitation with occurrence density<br><em>Dep:</em> occurrence count<br><em>Indep:</em> Temp, Precip</div>
+        </div>
+        <div class="node c-amber w-xl">
+          <div class="node-title"><span class="node-badge">ANALYSIS</span> Spatial Distribution Model</div>
+          <div class="node-body">Species Distribution Model (SDM) — MaxEnt or GLM/GAM<br><em>Dep:</em> presence probability<br><em>Indep:</em> LULC + Climate covariates<br><span class="gap-note">⚠ Model selection &amp; implementation gap</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- connector -->
+  <div class="connector" style="height:40px;">
+    <div class="arrow-line"></div>
+    <div class="connector-label">Model outputs &amp; statistics</div>
+    <div class="arrow-head"></div>
+  </div>
+
+  <!-- ════ PHASE 5: VISUALIZATION / FIGURES ════ -->
+  <div class="phase-row">
+    <div class="phase-label" style="border-color: var(--red);">5 — Final Figures</div>
+    <div class="phase-content">
+      <div class="node-row">
+        <div class="node c-red w-md">
+          <div class="node-title"><span class="node-badge">FIG 1</span> Distribution Map</div>
+          <div class="node-body">Choropleth / dot map of species occurrences overlaid on Virginia LULC classes — <code>ggplot2 + sf</code></div>
+        </div>
+        <div class="node c-red w-md">
+          <div class="node-title"><span class="node-badge">FIG 2</span> LULC Change × Species</div>
+          <div class="node-body">Faceted bar/tile chart: invasion intensity by LULC class across years 2017–2023</div>
+        </div>
+        <div class="node c-red w-md">
+          <div class="node-title"><span class="node-badge">FIG 3</span> SDM Prediction Surface</div>
+          <div class="node-body">Predicted habitat suitability raster map across Virginia — complex visualization of model output</div>
+        </div>
+        <div class="node c-red w-md">
+          <div class="node-title"><span class="node-badge">FIG 4</span> Climate Response Curves</div>
+          <div class="node-body">Occurrence probability vs. temperature &amp; precipitation — marginal effect plots</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- connector -->
+  <div class="connector" style="height:30px;">
+    <div class="arrow-line"></div>
+    <div class="arrow-head"></div>
+  </div>
+
+  <!-- ════ OUTPUT ════ -->
+  <div class="node-row">
+    <div class="node c-green w-xl" style="text-align:center; border-width:2px;">
+      <div class="node-title" style="justify-content:center; font-size:0.9rem;">🌿 Final Report &amp; Presentation</div>
+      <div class="node-body" style="text-align:center;">Spatial patterns of invasive plant species in Virginia in relation to land use change &amp; environmental variables<br><br>EVSC 4080/7080 · Spring 2026</div>
+    </div>
+  </div>
+
+  <!-- ════ LEGEND ════ -->
+  <div class="legend">
+    <div class="legend-item">
+      <div class="legend-swatch" style="background:var(--green-dim); border-color:var(--green);"></div> Raw Data Inputs
+    </div>
+    <div class="legend-item">
+      <div class="legend-swatch" style="background:var(--teal-dim); border-color:var(--teal);"></div> Processing Steps
+    </div>
+    <div class="legend-item">
+      <div class="legend-swatch" style="background:var(--purple-dim); border-color:var(--purple);"></div> Exploratory Analysis
+    </div>
+    <div class="legend-item">
+      <div class="legend-swatch" style="background:var(--amber-dim); border-color:var(--amber);"></div> Core Analysis / Models
+    </div>
+    <div class="legend-item">
+      <div class="legend-swatch" style="background:var(--red-dim); border-color:var(--red);"></div> Final Figures / Outputs
+    </div>
+    <div class="legend-item">
+      <span style="color:var(--red); font-size:0.9em;">⚠</span> Known Gap / Uncertainty
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
